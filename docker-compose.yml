@@ -1,0 +1,132 @@
+version: '3.3'
+
+networks:
+  backend-network:
+    driver: bridge
+  frontend-network:
+    driver: bridge
+volumes:
+  redis-data:
+  pg-data:
+  home-dir:
+
+services:
+  &php-service php: &php-service-template
+    build:
+      context: ./_docker/php
+      dockerfile: Dockerfile
+      args:
+        - PHP_VERSION=${PHP_VERSION}
+    volumes:
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+      - ./backend:/var/www:rw
+      - home-dir:/home/user
+    hostname: *php-service
+    environment:
+      PROJECT_HOST: "${PROJECT_HOST}"
+      DB_HOST: postgres
+      DB_PORT: &pg-port 5432
+      DB_DATABASE: &pg-db-name app
+      DB_USERNAME: &pg-username forge
+      DB_PASSWORD: &pg-password secret
+      SCHEDULE_PERIOD: 60
+      FPM_PORT: &php-fpm-port 9000
+      FPM_USER: "${USER_ID:-1000}"
+      FPM_GROUP: "${GROUP_ID:-1000}"
+      APP_ENV: local
+      APP_DEBUG: 'true'
+      HOME: /home/user
+      INSTALL_MEMCACHED: ${PHP_INSTALL_MEMCACHED}
+    command: >
+      sh -c "composer install --prefer-dist --no-scripts --working-dir=/var/www &&
+      php /var/www/init --env=Docker --overwrite=y &&
+      /wait-for-it.sh mariadb:3306 -- php yii migrate --interactive=0 &&
+      keep-alive.sh"
+    depends_on:
+  #    - redis
+      - postgres
+    networks:
+      - backend-network
+  # &queue-service queue:
+  #   <<: *php-service-template
+  #   hostname: *queue-service
+  #   command: php artisan queue:work
+  # &scheduler-service scheduler:
+  #   <<: *php-service-template
+  #   hostname: *scheduler-service
+  #   command: scheduler.sh "php /var/www/artisan schedule:run"
+  #   #command: scheduler.sh "php /var/www/yii schedule/run --scheduleFile=@app/config/schedule.php"
+  &php-fpm-service php-fpm:
+    <<: *php-service-template
+    user: 'root:root'
+    hostname: *php-fpm-service
+    ports: [*php-fpm-port]
+    entrypoint: /fpm-entrypoint.sh
+    command: php-fpm --nodaemonize -d "opcache.enable=0" -d "display_startup_errors=On" -d "display_errors=On" -d "error_reporting=E_ALL"
+    networks:
+      - backend-network
+      - frontend-network
+  nginx:
+    build:
+      context: ./_docker/nginx
+      dockerfile: Dockerfile
+      args:
+        - PHP_UPSTREAM_CONTAINER=php-fpm
+        - PHP_UPSTREAM_PORT=9000
+    volumes:
+      - ./backend:/var/www:ro
+      - ./_docker/nginx/logs:/var/log/nginx
+      - ./_docker/nginx/sites:/etc/nginx/sites-available
+      - ./_docker/nginx/ssl:/etc/nginx/ssl
+    ports:
+      - "${PROJECT_HOST}:4000:4000"
+      - "${PROJECT_HOST}:80:80"
+    depends_on:
+      - *php-fpm-service
+      - node
+    networks:
+      - frontend-network
+      - backend-network
+    logging:
+      driver: none
+  # redis:
+  #   image: redis:5.0.5-alpine
+  #   command: redis-server
+  #   volumes:
+  #     - redis-data:/data:rw
+  #   ports: [*redis-port, '${PROJECT_HOST}:16379:6379'] # Port 16379 for connecting from localhost
+  #   networks:
+  #     - backend-network
+  postgres:
+    image: postgres:11-alpine
+    environment:
+      POSTGRES_DB: *pg-db-name
+      POSTGRES_USER: *pg-username
+      POSTGRES_PASSWORD: *pg-password
+    volumes:
+      - pg-data:/var/lib/postgresql:rw
+    ports: [*pg-port, '${PROJECT_HOST}:5432:5432'] # Port 15432 for connecting from localhost using, for example, data-grip
+    networks:
+      - backend-network
+      - frontend-network
+  node:
+    build:
+      context: ./
+      dockerfile: ./_docker/node/Dockerfile
+    volumes:
+      - './frontend:/app:z'
+    ports:
+      - "${PROJECT_HOST}:3000:3000"
+    stdin_open: true
+    command: /bin/sh -c "yarn install && yarn start"
+    networks:
+      - backend-network
+      - frontend-network
+  adminer:
+    image: adminer:4
+    networks:
+      - backend-network
+      - frontend-network
+    ports:
+      - "${PROJECT_HOST}:8080:8080"
